@@ -1,155 +1,208 @@
 
 import os
+import re
 import json
-import csv
+import gzip
+import sqlite3
 import hashlib
 import logging
 from pathlib import Path
 from collections import Counter
 
-ROOT = Path(__file__).resolve().parent.parent
-RAW = ROOT / "raw"
-PROCESSED = ROOT / "processed"
-REJECTED = ROOT / "rejected"
-REPORTS = ROOT / "reports"
+from datasets import load_dataset
 
-for folder in (PROCESSED, REJECTED, REPORTS):
-    folder.mkdir(parents=True, exist_ok=True)
+ROOT = Path(__file__).resolve().parent.parent
+OUT = ROOT / "quarantine"
+REPORTS = ROOT / "reports"
+DB_PATH = ROOT / "dedup.sqlite"
+
+OUT.mkdir(exist_ok=True)
+REPORTS.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Candidate datasets selected for ULTIMATE QWEN
+SOURCES = [
+    {
+        "id": "AletheiaResearch/GPT-5.5-Codex",
+        "category": "coding",
+    },
+    {
+        "id": "greghavens/gpt-5.6-sol-coding-and-debugging-traces",
+        "category": "agent",
+    },
+    {
+        "id": "sollamon/ox-alpha-glm-5.3-flash-distillation-coding-17k-raw",
+        "category": "coding",
+    },
+    {
+        "id": "Crownelius/GLM-5.0-25000x",
+        "category": "reasoning",
+    },
+    {
+        "id": "saidutta69/fable-5-premium-v2",
+        "category": "reasoning",
+    },
+    {
+        "id": "DSFFGFG456/fable-5-coding-and-debugging-traces",
+        "category": "agent",
+    },
+    {
+        "id": "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x",
+        "category": "reasoning",
+    },
+    {
+        "id": "saidutta69/claude-mythos-distilled-25k-clean",
+        "category": "reasoning",
+    },
+    {
+        "id": "faunix/Qwen3.8-27B-Distillation-40K",
+        "category": "general",
+    },
+    {
+        "id": "Jackrong/DeepSeek-V4-Distill-8000x",
+        "category": "reasoning",
+    },
+]
+
 stats = Counter()
-seen = set()
 errors = []
-categories = {
-    "coding": [],
-    "agent": [],
-    "reasoning": [],
-    "mathematics": [],
-    "science": [],
-    "general": []
-}
+source_reports = []
 
-def read_json(path):
-    with path.open("r", encoding="utf-8-sig") as f:
-        return json.load(f)
+db = sqlite3.connect(DB_PATH)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS seen (
+        fingerprint TEXT PRIMARY KEY
+    )
+""")
+db.commit()
 
-def read_jsonl(path):
-    with path.open("r", encoding="utf-8-sig") as f:
-        for line in f:
-            if line.strip():
-                yield json.loads(line)
 
-def read_csv(path):
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        yield from csv.DictReader(f)
-
-def read_parquet(path):
-    import pyarrow.parquet as pq
-    parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=500):
-        for row in batch.to_pylist():
-            yield row
-
-def records_from(path):
-    suffix = path.suffix.lower()
-
-    if suffix == ".jsonl":
-        yield from read_jsonl(path)
-    elif suffix == ".json":
-        data = read_json(path)
-        if isinstance(data, list):
-            yield from data
-        elif isinstance(data, dict):
-            for key in ("data", "records", "examples", "conversations"):
-                if isinstance(data.get(key), list):
-                    yield from data[key]
-                    return
-            yield data
-    elif suffix == ".csv":
-        yield from read_csv(path)
-    elif suffix == ".parquet":
-        yield from read_parquet(path)
-    else:
-        stats["unsupported_files"] += 1
-
-def get_text(value):
+def text_value(value):
     if isinstance(value, str):
         return value
+
     if isinstance(value, list):
         parts = []
         for item in value:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 parts.append(item)
+            elif isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
         return "\n".join(parts)
-    return ""
+
+    if value is None:
+        return ""
+
+    return json.dumps(value, ensure_ascii=False)
+
 
 def normalize_messages(record):
     messages = record.get("messages")
 
+    if not isinstance(messages, list):
+        messages = record.get("conversations")
+
     if isinstance(messages, list):
         result = []
-        for msg in messages:
-            if not isinstance(msg, dict):
+
+        for item in messages:
+            if not isinstance(item, dict):
                 continue
 
-            role = msg.get("role") or msg.get("from")
-            content = msg.get("content", msg.get("value", ""))
+            role = (
+                item.get("role")
+                or item.get("from")
+                or item.get("speaker")
+            )
 
-            if role == "human":
-                role = "user"
-            elif role in ("gpt", "bot"):
-                role = "assistant"
+            role = str(role).lower() if role else ""
 
-            if role not in ("system", "developer", "user", "assistant", "tool"):
+            role_map = {
+                "human": "user",
+                "user": "user",
+                "gpt": "assistant",
+                "bot": "assistant",
+                "model": "assistant",
+                "assistant": "assistant",
+                "system": "system",
+                "developer": "developer",
+                "tool": "tool",
+                "function": "tool",
+            }
+
+            role = role_map.get(role)
+
+            if not role:
                 continue
 
-            normalized = {"role": role}
+            content = item.get(
+                "content",
+                item.get("value", item.get("text", ""))
+            )
 
-            if isinstance(content, (str, list)):
-                normalized["content"] = content
-            else:
-                normalized["content"] = json.dumps(
-                    content, ensure_ascii=False
-                )
+            message = {
+                "role": role,
+                "content": content if isinstance(
+                    content, (str, list, dict)
+                ) else text_value(content)
+            }
 
-            for key in ("name", "tool_call_id", "tool_calls"):
-                if key in msg:
-                    normalized[key] = msg[key]
+            for key in (
+                "name",
+                "tool_call_id",
+                "tool_calls",
+                "function_call"
+            ):
+                if key in item:
+                    message[key] = item[key]
 
-            result.append(normalized)
+            result.append(message)
 
-        return result
+        if result:
+            return result
 
-    # Common instruction/input/output format
-    instruction = get_text(record.get("instruction", record.get("prompt", "")))
-    input_text = get_text(record.get("input", ""))
-    output = get_text(
-        record.get("output", record.get("response", record.get("completion", "")))
+    # Instruction / input / output datasets
+    instruction = text_value(
+        record.get("instruction", record.get("prompt", ""))
     )
 
-    if instruction and output:
+    extra_input = text_value(record.get("input", ""))
+
+    answer = text_value(
+        record.get(
+            "output",
+            record.get(
+                "response",
+                record.get(
+                    "completion",
+                    record.get("chosen", "")
+                )
+            )
+        )
+    )
+
+    if instruction and answer:
         user_text = instruction
-        if input_text:
-            user_text += "\n\n" + input_text
+
+        if extra_input:
+            user_text += "\n\n" + extra_input
 
         return [
             {"role": "user", "content": user_text},
-            {"role": "assistant", "content": output}
+            {"role": "assistant", "content": answer}
         ]
 
-    # Question / answer format
-    question = get_text(
+    # Question / answer datasets
+    question = text_value(
         record.get("question", record.get("problem", ""))
     )
-    answer = get_text(
+
+    answer = text_value(
         record.get("answer", record.get("solution", ""))
     )
 
@@ -161,170 +214,235 @@ def normalize_messages(record):
 
     return None
 
-def detect_language(messages):
-    text = " ".join(
-        get_text(m.get("content", ""))
+
+def english_check(messages, record):
+    declared = str(
+        record.get("language", record.get("lang", ""))
+    ).lower()
+
+    if declared:
+        if declared in ("en", "eng", "english"):
+            pass
+        elif declared in ("ja", "jp", "japanese", "zh", "chinese"):
+            return False
+
+    content = " ".join(
+        text_value(m.get("content", ""))
         for m in messages
     )
 
-    if not text.strip():
-        return "unknown"
+    # Exclude Japanese-script examples.
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", content):
+        return False
 
-    import re
-    japanese = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", text))
-    latin = len(re.findall(r"[A-Za-z]", text))
+    letters = re.findall(r"[A-Za-z]", content)
+    non_latin = re.findall(
+        r"[\u4e00-\u9fff\u0400-\u04ff\u0600-\u06ff]",
+        content
+    )
 
-    if japanese > latin:
-        return "ja"
-    return "en"
+    if letters and len(non_latin) / len(letters) > 0.20:
+        return False
 
-def detect_category(record, messages, source):
-    value = " ".join([
-        str(record.get("category", "")),
-        str(record.get("tags", "")),
-        source
-    ]).lower()
+    return bool(content.strip())
 
-    if any(x in value for x in ("agent", "tool", "trajectory")):
-        return "agent"
-    if any(x in value for x in ("math", "algebra", "calculus")):
-        return "mathematics"
-    if any(x in value for x in ("science", "physics", "biology")):
-        return "science"
-    if any(x in value for x in ("reason", "logic", "thinking")):
-        return "reasoning"
-    if any(x in value for x in ("code", "program", "debug", "software")):
-        return "coding"
 
-    content = " ".join(
-        get_text(m.get("content", ""))
-        for m in messages
-    ).lower()
+def make_record(row, source, index):
+    messages = normalize_messages(row)
 
-    if any(x in content for x in (
-        "```", "def ", "class ", "function ", "import ", "compile"
-    )):
-        return "coding"
+    if not messages:
+        return None
 
-    return "general"
+    roles = {m["role"] for m in messages}
 
-def process_record(record, source):
-    if not isinstance(record, dict):
-        stats["invalid_records"] += 1
-        return
+    if "user" not in roles or "assistant" not in roles:
+        return None
 
-    messages = normalize_messages(record)
-
-    if not messages or len(messages) < 2:
-        stats["invalid_records"] += 1
-        return
-
-    if not any(
-        m["role"] == "assistant" and get_text(m.get("content", "")).strip()
-        for m in messages
-    ):
-        stats["invalid_records"] += 1
-        return
-
-    if detect_language(messages) != "en":
+    if not english_check(messages, row):
         stats["non_english"] += 1
-        return
+        return None
+
+    canonical = json.dumps(
+        messages,
+        ensure_ascii=False,
+        sort_keys=True
+    )
 
     fingerprint = hashlib.sha256(
-        json.dumps(messages, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        canonical.encode("utf-8")
     ).hexdigest()
 
-    if fingerprint in seen:
+    try:
+        db.execute(
+            "INSERT INTO seen (fingerprint) VALUES (?)",
+            (fingerprint,)
+        )
+    except sqlite3.IntegrityError:
         stats["duplicates"] += 1
-        return
+        return None
 
-    seen.add(fingerprint)
-
-    category = detect_category(record, messages, source)
-
-    output = {
-        "messages": messages,
-        "metadata": {
-            "source_dataset": source,
-            "source_id": str(
-                record.get("id", record.get("source_id", ""))
-            ),
-            "language": "en",
-            "category": category
-        }
+    metadata = {
+        "source_dataset": source["id"],
+        "source_id": str(row.get("id", index)),
+        "category": source["category"],
+        "language": "en",
+        "rights_status": "unverified_quarantine"
     }
 
-    categories[category].append(output)
-    stats["accepted"] += 1
+    for key in ("teacher_model", "model", "difficulty"):
+        if row.get(key) is not None:
+            metadata[key] = row[key]
+
+    return {
+        "messages": messages,
+        "metadata": metadata
+    }
+
+
+def get_splits(dataset):
+    if hasattr(dataset, "keys"):
+        return [
+            (str(name), split)
+            for name, split in dataset.items()
+        ]
+
+    return [("train", dataset)]
+
+
+def process_source(source):
+    repo = source["id"]
+    logging.info("Starting: %s", repo)
+
+    source_stats = Counter()
+    safe_name = repo.replace("/", "__")
+
+    output_path = OUT / f"{safe_name}.jsonl.gz"
+
+    token = os.environ.get("HF_TOKEN") or None
+
+    try:
+        dataset = load_dataset(
+            repo,
+            streaming=True,
+            token=token
+        )
+
+        with gzip.open(
+            output_path,
+            "wt",
+            encoding="utf-8"
+        ) as output:
+
+            for split_name, split in get_splits(dataset):
+                logging.info(
+                    "%s: processing split %s",
+                    repo,
+                    split_name
+                )
+
+                for index, row in enumerate(split):
+                    source_stats["read"] += 1
+                    stats["read"] += 1
+
+                    try:
+                        item = make_record(row, source, index)
+
+                        if item is None:
+                            source_stats["rejected"] += 1
+                            continue
+
+                        output.write(
+                            json.dumps(
+                                item,
+                                ensure_ascii=False
+                            ) + "\n"
+                        )
+
+                        source_stats["accepted"] += 1
+                        stats["accepted"] += 1
+
+                        if stats["read"] % 5000 == 0:
+                            db.commit()
+                            logging.info(
+                                "Progress: %s rows",
+                                stats["read"]
+                            )
+
+                    except Exception as exc:
+                        source_stats["errors"] += 1
+                        errors.append({
+                            "dataset": repo,
+                            "row": index,
+                            "error": str(exc)
+                        })
+
+        db.commit()
+
+        result = {
+            "dataset": repo,
+            "file": str(output_path.relative_to(ROOT)),
+            "status": "success",
+            "statistics": dict(source_stats)
+        }
+
+        logging.info(
+            "Finished %s: %s",
+            repo,
+            dict(source_stats)
+        )
+
+    except Exception as exc:
+        db.commit()
+
+        result = {
+            "dataset": repo,
+            "status": "failed",
+            "error": str(exc)
+        }
+
+        errors.append(result)
+        logging.exception("Dataset failed: %s", repo)
+
+    source_reports.append(result)
+
 
 def main():
-    if not RAW.exists():
-        logging.error("raw/ directory does not exist.")
-        return
+    logging.info(
+        "ULTIMATE QWEN collection started. Sources: %d",
+        len(SOURCES)
+    )
 
-    files = [
-        p for p in RAW.rglob("*")
-        if p.is_file()
-        and p.suffix.lower() in (".json", ".jsonl", ".csv", ".parquet")
-    ]
+    for source in SOURCES:
+        process_source(source)
 
-    logging.info("Found %d source files", len(files))
-
-    for path in files:
-        source = path.relative_to(RAW).parts[0]
-        logging.info("Processing: %s", path)
-
-        try:
-            for record in records_from(path):
-                stats["total"] += 1
-                try:
-                    process_record(record, source)
-                except Exception as exc:
-                    stats["record_errors"] += 1
-                    errors.append({
-                        "file": str(path.relative_to(ROOT)),
-                        "error": str(exc)
-                    })
-        except Exception as exc:
-            stats["file_errors"] += 1
-            errors.append({
-                "file": str(path.relative_to(ROOT)),
-                "error": str(exc)
-            })
-            logging.exception("Failed: %s", path)
-
-    for category, records in categories.items():
-        output_path = PROCESSED / f"{category}.jsonl"
-
-        with output_path.open("w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        logging.info("%s: %d records", category, len(records))
+    db.commit()
+    db.close()
 
     report = {
-        "statistics": dict(stats),
-        "category_counts": {
-            key: len(value) for key, value in categories.items()
-        },
-        "source_files": len(files)
+        "project": "ULTIMATE QWEN",
+        "total_statistics": dict(stats),
+        "sources": source_reports,
+        "errors": errors
     }
 
-    (REPORTS / "statistics.json").write_text(
+    (REPORTS / "collection_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
-    (REPORTS / "errors.json").write_text(
-        json.dumps(errors, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-    logging.info("Normalization complete.")
-    logging.info("Total: %d", stats["total"])
+    logging.info("================================")
+    logging.info("COLLECTION FINISHED")
+    logging.info("Read: %d", stats["read"])
     logging.info("Accepted: %d", stats["accepted"])
     logging.info("Duplicates: %d", stats["duplicates"])
     logging.info("Non-English: %d", stats["non_english"])
+    logging.info("================================")
+
+    if stats["read"] == 0:
+        raise RuntimeError(
+            "No records were read from any dataset."
+        )
+
 
 if __name__ == "__main__":
     main()
