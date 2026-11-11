@@ -5,14 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "成功した収集RunのID"
+        description: "43019372413"
         required: true
       artifact_name:
-        description: "既存Artifact名"
+        description: "ultimate-qwen-validated-data"
         required: true
         default: "ultimate-qwen-collected-data"
       repo_id:
-        description: "Hugging Face Dataset ID (username/dataset-name)"
+        description: "Hugging Face Dataset ID (yagyu77/ultimet-qwen)"
         required: true
 
 permissions:
