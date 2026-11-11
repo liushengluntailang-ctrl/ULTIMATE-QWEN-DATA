@@ -1,20 +1,15 @@
 
-name: Upload Existing QWEN Dataset
+name: Transfer Existing Artifact to Hugging Face
 
 on:
   workflow_dispatch:
-    inputs:
-      repo_id:
-        description: Hugging Face Dataset ID
-        required: true
-        type: string
 
 permissions:
   actions: read
   contents: read
 
 jobs:
-  upload:
+  transfer:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -25,22 +20,22 @@ jobs:
           name: ultimate-qwen-validated-data
           run-id: "43019372413"
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: ./dataset
+          repository: liushengluntailang-ctrl/ULTIMATE-QWEN-DATA
+          path: ./data
 
-      - name: Install Hugging Face
-        run: pip install -U "huggingface_hub[hf_xet]"
+      - name: Install Hugging Face Hub
+        run: pip install -U huggingface_hub hf_xet
 
-      - name: Upload Dataset
+      - name: Upload to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_REPO: ${{ inputs.repo_id }}
         run: |
           python - <<'PY'
           import os
           from huggingface_hub import HfApi
 
           api = HfApi(token=os.environ["HF_TOKEN"])
-          repo = os.environ["HF_DATASET_REPO"]
+          repo = "yagyu77/ultimate-qwen-dataset"
 
           api.create_repo(
               repo_id=repo,
@@ -50,12 +45,12 @@ jobs:
           )
 
           api.upload_folder(
-              folder_path="./dataset",
+              folder_path="./data",
               repo_id=repo,
               repo_type="dataset",
               path_in_repo=".",
-              commit_message="Upload existing ULTIMATE QWEN dataset"
+              commit_message="Transfer existing validated QWEN artifact"
           )
 
-          print("UPLOAD SUCCESSFUL")
+          print("TRANSFER COMPLETE")
           PY
