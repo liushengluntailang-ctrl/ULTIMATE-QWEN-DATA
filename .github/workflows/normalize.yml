@@ -1,0 +1,75 @@
+
+name: Normalize Dataset to JSONL
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "raw/**"
+      - "scripts/**"
+      - ".github/workflows/normalize.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dataset-normalization
+  cancel-in-progress: false
+
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install datasets pyarrow pandas tqdm
+
+      - name: Create output directories
+        run: |
+          mkdir -p processed
+          mkdir -p reports
+          mkdir -p rejected
+
+      - name: Normalize datasets
+        run: |
+          python scripts/normalize.py
+
+      - name: Show processing results
+        if: always()
+        run: |
+          echo "=== Processed files ==="
+          find processed -type f -maxdepth 2
+          echo "=== Reports ==="
+          find reports -type f -maxdepth 2
+
+      - name: Commit normalized data
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add processed reports rejected
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Automated dataset normalization"
+            git push
+          else
+            echo "No changes to commit."
+          fi
